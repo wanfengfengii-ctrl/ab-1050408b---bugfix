@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -323,6 +324,40 @@ class ApiTests(unittest.TestCase):
             })
             self.assertEqual(status, 400)
             self.assertEqual(body["field"], "gap_limit_enabled")
+
+    def test_high_tolerance_gap_limit_boundary_in_time(self):
+        # The maximal legal high-tolerance boundary request must return the
+        # full, exact calibration well inside the API response deadline.
+        with ServerHarness() as h:
+            payload = {
+                "probe_a": [1000003 * i * i + 7919 * i for i in range(24)],
+                "probe_b": [999983 * i * i + 12347 * i for i in range(24)],
+                "offset_min": -10**12,
+                "offset_max": 10**12,
+                "tolerance": 10**12,
+                "min_pairs": 24,
+                "gap_limit_enabled": True,
+                "max_gap_a": 22,
+                "max_gap_b": 22,
+            }
+            start = time.monotonic()
+            status, body = h.post(payload)
+            elapsed = time.monotonic() - start
+            self.assertEqual(status, 200, body)
+            self.assertLess(elapsed, 12.0)
+            self.assertTrue(body["sufficient"])
+            self.assertEqual(body["offset"], -46288)
+            self.assertEqual(body["pair_count"], 24)
+            self.assertEqual(body["residual_abs_sum"], 571392)
+            self.assertEqual(body["max_abs_residual"], 46288)
+            self.assertEqual(len(body["pairs"]), 24)
+            self.assertEqual(len(body["gap_segments"]), 23)
+            self.assertTrue(
+                all(
+                    s["skipped_a"] == 0 and s["skipped_b"] == 0
+                    for s in body["gap_segments"]
+                )
+            )
 
 
 if __name__ == "__main__":

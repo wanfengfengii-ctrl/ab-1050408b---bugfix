@@ -10,10 +10,13 @@ which directly rules out any offset-scan shortcut or missed optimum.
 from __future__ import annotations
 
 import random
+import time
 import unittest
 from itertools import combinations
 
 from app.alignment import (
+    _best_score_at,
+    _best_score_constrained,
     best_pairing_at,
     best_pairing_constrained,
     solve,
@@ -138,6 +141,31 @@ class SolverTests(unittest.TestCase):
         self.assertEqual(res.pair_count, 8)
         self.assertEqual(res.residual_abs_sum, 0)
 
+    def test_high_tolerance_gap_limit_boundary(self):
+        # Maximal legal high-tolerance request: 24 quadratic pulses per
+        # side, +/-10^12 offset interval, tolerance 10^12, gap limits 22/22.
+        # The joint optimum must be exact and return well within the API
+        # response deadline.
+        A = [1000003 * i * i + 7919 * i for i in range(24)]
+        B = [999983 * i * i + 12347 * i for i in range(24)]
+        start = time.monotonic()
+        res = solve(A, B, -10**12, 10**12, 10**12, 24, True, 22, 22)
+        elapsed = time.monotonic() - start
+        self.assertTrue(res.sufficient)
+        self.assertEqual(res.pair_count, 24)
+        self.assertEqual(res.offset, -46288)
+        self.assertEqual(res.residual_abs_sum, 571392)
+        self.assertEqual(res.max_abs_residual, 46288)
+        self.assertEqual(len(res.pairs), 24)
+        self.assertLess(elapsed, 10.0)
+        # Same request without the gap limits: identical calibration.
+        res2 = solve(A, B, -10**12, 10**12, 10**12, 24)
+        self.assertEqual(
+            (res2.offset, res2.pair_count,
+             res2.residual_abs_sum, res2.max_abs_residual),
+            (-46288, 24, 571392, 46288),
+        )
+
     def test_dp_matches_enumeration_fixed_offset(self):
         rng = random.Random(4242)
         for _ in range(300):
@@ -225,6 +253,101 @@ class SolverTests(unittest.TestCase):
                 [(p.index_a - 1, p.index_b - 1) for p in res.pairs],
                 [tuple(p) for p in best_pairs],
             )
+
+def _full_candidate_offsets(A, B, tol, lo, hi):
+    """Reference: the unpruned critical-value candidate offset set.
+
+    Edge-critical values plus the extrema midpoints of *every* co-orderable
+    edge pair within 2*tol -- the set the solver used before the two-phase
+    pruning.  The pruned solver must agree with a scan of this set exactly.
+    """
+    edges = [(i, j, a - b) for i, a in enumerate(A) for j, b in enumerate(B)]
+    cand = {lo, hi}
+    for (_i, _j, cv) in edges:
+        for d in (cv - tol, cv, cv + tol, cv + tol + 1):
+            if lo <= d <= hi:
+                cand.add(d)
+    for x in range(len(edges)):
+        i, j, c1 = edges[x]
+        for y in range(x + 1, len(edges)):
+            i2, j2, c2 = edges[y]
+            if (i2 - i) * (j2 - j) <= 0:
+                continue
+            chi, clo = max(c1, c2), min(c1, c2)
+            if chi - clo > 2 * tol:
+                continue
+            flo, fhi = max(lo, chi - tol), min(hi, clo + tol)
+            if flo > fhi:
+                continue
+            total = c1 + c2
+            for md in (total // 2, -((-total) // 2)):
+                d = md if flo <= md <= fhi else (flo if md < flo else fhi)
+                if lo <= d <= hi:
+                    cand.add(d)
+    return cand
+
+
+class FastScoreTests(unittest.TestCase):
+    def test_lean_scores_match_full_objectives(self):
+        # The lean scan DPs must reproduce the first three objective
+        # components of the full tie-breaking DPs exactly.
+        rng = random.Random(31337)
+        for _ in range(500):
+            n = rng.randint(1, 6)
+            m = rng.randint(1, 6)
+            A = make_increasing(rng, n, 60)
+            B = make_increasing(rng, m, 60)
+            d = rng.randint(-30, 30)
+            tol = rng.randint(0, 10)
+            ga, gb = rng.randint(0, 5), rng.randint(0, 5)
+            c = [[a - b - d for b in B] for a in A]
+            obj, _ = best_pairing_at(c, tol)
+            self.assertEqual(_best_score_at(A, B, d, tol), obj[:3])
+            objc, _ = best_pairing_constrained(A, B, d, tol, ga, gb)
+            self.assertEqual(
+                _best_score_constrained(A, B, d, tol, ga, gb), objc[:3]
+            )
+
+    def test_pruned_candidates_match_full_scan(self):
+        # The two-phase pruned candidate set must yield exactly the same
+        # global optimum as the unpruned critical-value set, with and
+        # without the gap limits.
+        rng = random.Random(1357)
+        for _ in range(80):
+            n = rng.randint(2, 6)
+            m = rng.randint(2, 6)
+            A = make_increasing(rng, n, 80)
+            B = make_increasing(rng, m, 80)
+            lo = rng.randint(-30, 0)
+            hi = lo + rng.randint(0, 40)
+            tol = rng.randint(0, 12)
+            ga, gb = rng.randint(0, 4), rng.randint(0, 4)
+            best = best_c = None
+            for d in _full_candidate_offsets(A, B, tol, lo, hi):
+                c = [[a - b - d for b in B] for a in A]
+                obj, _ = best_pairing_at(c, tol)
+                s = (obj[0], obj[1], obj[2], -d)
+                if best is None or s > best:
+                    best = s
+                objc, _ = best_pairing_constrained(A, B, d, tol, ga, gb)
+                sc = (objc[0], objc[1], objc[2], -d)
+                if best_c is None or sc > best_c:
+                    best_c = sc
+            res = solve(A, B, lo, hi, tol, 1)
+            self.assertEqual(
+                (res.offset, res.pair_count,
+                 res.residual_abs_sum, res.max_abs_residual),
+                (-best[3], best[0], -best[1], -best[2]),
+                msg=f"A={A} B={B} lo={lo} hi={hi} tol={tol}",
+            )
+            resc = solve(A, B, lo, hi, tol, 1, True, ga, gb)
+            self.assertEqual(
+                (resc.offset, resc.pair_count,
+                 resc.residual_abs_sum, resc.max_abs_residual),
+                (-best_c[3], best_c[0], -best_c[1], -best_c[2]),
+                msg=f"A={A} B={B} lo={lo} hi={hi} tol={tol} ga={ga} gb={gb}",
+            )
+
 
 class GapConstraintTests(unittest.TestCase):
     def test_gap_segments_counts_and_leading_trailing_free(self):

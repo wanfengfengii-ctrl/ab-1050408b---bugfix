@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -166,6 +167,49 @@ def main() -> int:
     status, body = request("POST", "/api/calibrate", bad_gap)
     check(status == 400, "negative gap limit rejected")
     check(body.get("field") == "max_gap_b", "error field points at max_gap_b")
+
+    # ---- Maximal legal high-tolerance boundary scenario ------------------
+    # 24 strictly increasing quadratic pulses per side, the widest +/-1e12
+    # offset interval, tolerance 1e12, min_pairs 24 and gap limits 22/22.
+    # This is the largest legal request of its kind; it must return the
+    # exact joint optimum well inside the 15 s response deadline.
+    boundary = {
+        "probe_a": [1000003 * i * i + 7919 * i for i in range(24)],
+        "probe_b": [999983 * i * i + 12347 * i for i in range(24)],
+        "offset_min": -10**12,
+        "offset_max": 10**12,
+        "tolerance": 10**12,
+        "min_pairs": 24,
+        "gap_limit_enabled": True,
+        "max_gap_a": 22,
+        "max_gap_b": 22,
+    }
+    started = time.monotonic()
+    status, body = request("POST", "/api/calibrate", boundary)
+    elapsed = time.monotonic() - started
+    check(status == 200, f"boundary scenario HTTP 200 (got {status})")
+    check(
+        elapsed < 15,
+        f"boundary scenario answered within the deadline ({elapsed:.2f}s)",
+    )
+    check(body.get("sufficient") is True, "boundary scenario sufficient")
+    check(body.get("offset") == -46288, "boundary offset is -46288")
+    check(body.get("pair_count") == 24, "boundary 24 pairs")
+    check(
+        body.get("residual_abs_sum") == 571392,
+        "boundary residual abs sum is 571392",
+    )
+    check(
+        body.get("max_abs_residual") == 46288,
+        "boundary max abs residual is 46288",
+    )
+    check(len(body.get("pairs", [])) == 24, "boundary 24 pair records")
+    segs = body.get("gap_segments", [])
+    check(len(segs) == 23, "boundary 23 between-pair segments")
+    check(
+        all(s["skipped_a"] == 0 and s["skipped_b"] == 0 for s in segs),
+        "boundary segments skip no pulses",
+    )
 
     print("SMOKE OK")
     return 0

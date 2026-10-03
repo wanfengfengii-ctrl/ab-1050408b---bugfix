@@ -16,29 +16,35 @@ A pair (i, j) is admissible at offset d iff |c_ij - d| <= tolerance, where
 c_ij = a_i - b_j, i.e. d lies in the integer window [c_ij - T, c_ij + T].
 
 The offset interval may span 2,000,000,000 nanoseconds, so we never scan it
-nanosecond by nanosecond.  Instead we build a finite, provably sufficient set
-of candidate offsets and run the O(n*m) matching DP once per candidate:
+nanosecond by nanosecond.  Instead we evaluate a finite, provably sufficient
+set of candidate offsets, built in two phases so that even the loosest legal
+tolerance keeps the candidate count small:
 
-* c_ij - T, c_ij, c_ij + T and c_ij + T + 1 for every edge (i, j):
-  feasibility-window boundaries (first/last feasible integer and first
-  infeasible one) and residual kinks.  A maximum-pair matching feasible at
-  any offset is also feasible at its window's boundary, and the absolute-
-  residual sum's minimiser is either a median matched c_ij or, when the
-  median plateau lies outside the feasible window, a clamped boundary
-  c_ij +/- T -- so every optimum of objectives 1 and 2 lies on these points.
-* floor/ceil of (c_p + c_q) / 2 for every pair of *co-orderable* edges
-  (i,j),(i',j') that can occur together in an order-preserving matching --
-  strictly i<i' and j<j', or vice versa -- restricted to offsets at which
-  both edges are within tolerance (|c_p - c_q| <= 2T).  For any fixed
-  matching, its largest absolute residual is max(c_max - d, d - c_min), whose
-  integer minimiser is the (possibly half-integer) midpoint of two matched
-  edges, so every objective-3 optimum is one of these points.
-* the interval endpoints.
+* Phase 1 -- edge-critical offsets: c_ij - T, c_ij, c_ij + T and
+  c_ij + T + 1 for every edge (i, j), plus the interval endpoints.  These
+  are the feasibility-window boundaries (first/last feasible integer, first
+  infeasible one) and the residual kinks.  The pair count only changes at
+  window boundaries, and on every constant-feasibility stretch the
+  absolute-residual sum -- a minimum of convex piecewise-linear functions --
+  is minimised at a kink (a matched c_ij) or at the stretch boundary, so
+  objectives 1 and 2 of the joint optimum are attained on this set.  The
+  best objective-3 value found here is an upper bound ``U`` on the optimum's
+  largest absolute residual.
+* Phase 2 -- extrema midpoints: floor/ceil of (c_p + c_q) / 2 for every pair
+  of *co-orderable* edges (i,j),(i',j') that can occur together in an
+  order-preserving matching -- strictly i<i' and j<j', or vice versa --
+  whose c-values differ by at most 2U.  For any fixed matching, its largest
+  absolute residual is max(c_max - d, d - c_min), whose integer minimiser is
+  the (possibly half-integer) midpoint of its two residual extrema; an
+  optimal matching's extrema differ by at most twice the optimal largest
+  residual, hence by at most 2U.  Every objective-3 optimum therefore lies
+  on one of these midpoints (clamped to the pair's joint feasible window)
+  or on the phase-1 set -- midpoints of wider pairs can never win.
 
-There are at most 4*n*m + 2 + O((n*m)^2) such values before filtering; with
-n, m <= 24 the co-order and |c - c'| <= 2T filters keep only a few thousand
-candidates (worst measured case under one second), and every visited offset is
-derived from pairing critical values -- never from scanning.
+Each candidate offset is evaluated with the O(n*m) matching DP (a lean
+integer-only variant for the scan; the full objective DP re-derives the
+winning matching once at the end).  Every visited offset is derived from
+pairing critical values -- never from scanning.
 
 Optional "consecutive gap" limits
 ---------------------------------
@@ -278,59 +284,285 @@ def _residual_matrix(A: Sequence[int], B: Sequence[int], offset: int):
     return [[a - b - offset for b in B] for a in A]
 
 
-def _candidate_offsets(
-    A: Sequence[int], B: Sequence[int], tol: int, lo: int, hi: int
-) -> List[int]:
-    """Finite, provably sufficient set of offsets to evaluate.
+def _best_score_at(
+    A: Sequence[int], B: Sequence[int], offset: int, tol: int
+) -> Tuple[int, int, int]:
+    """(count, -abs_sum, -max_abs) of the optimal matching at ``offset``.
 
-    See the module docstring for why the global optimum must lie in this set.
+    Identical to the first three components of ``best_pairing_at``'s
+    objective -- the index tie-break only decides between matchings whose
+    first three components agree, so it cannot change them -- but computed
+    with plain integer tuples and no per-cell index bookkeeping, so it can
+    run over many candidate offsets quickly.
     """
-    # Every edge with its raw c_ij = a_i - b_j.
-    edges: List[Tuple[int, int, int]] = [
-        (i, j, a - b)
-        for i, a in enumerate(A)
-        for j, b in enumerate(B)
+    n = len(A)
+    m = len(B)
+    zero = (0, 0, 0)
+    prev = [zero] * (m + 1)
+    cur = [zero] * (m + 1)
+    for i in range(1, n + 1):
+        a = A[i - 1]
+        cur[0] = zero
+        for j in range(1, m + 1):
+            up = prev[j]
+            left = cur[j - 1]
+            best = up if up >= left else left
+            e = a - B[j - 1] - offset
+            if -tol <= e <= tol:
+                diag = prev[j - 1]
+                ae = e if e >= 0 else -e
+                nae = -ae
+                cand = (
+                    diag[0] + 1,
+                    diag[1] - ae,
+                    diag[2] if diag[2] < nae else nae,
+                )
+                if cand > best:
+                    best = cand
+            cur[j] = best
+        prev, cur = cur, prev
+    return prev[m]
+
+
+def _best_score_constrained(
+    A: Sequence[int],
+    B: Sequence[int],
+    offset: int,
+    tol: int,
+    max_gap_a: int,
+    max_gap_b: int,
+) -> Tuple[int, int, int]:
+    """(count, -abs_sum, -max_abs) of the optimal gap-limited chain.
+
+    Identical to the first three components of
+    ``best_pairing_constrained``'s objective (same reasoning as
+    ``_best_score_at``), using the same monotone-deque chain DP but with
+    lightweight integer-tuple objectives.
+    """
+    n = len(A)
+    m = len(B)
+
+    # col_val[j][i] is the objective of the best chain whose last edge is
+    # (i, j), or None when (i, j) is infeasible at this offset.
+    col_val: List[List[Optional[Tuple[int, int, int]]]] = [
+        [None] * n for _ in range(m)
     ]
+    col_deq: List[Deque[int]] = [deque() for _ in range(m)]
+    # col_top[j] caches the window maximum col_val[j][col_deq[j][0]].
+    col_top: List[Optional[Tuple[int, int, int]]] = [None] * m
+    global_deq: Deque[int] = deque()
 
+    final: Optional[Tuple[int, int, int]] = None
+
+    for i in range(n):
+        a = A[i]
+        row_lo = i - max_gap_a - 1
+        if row_lo < 0:
+            row_lo = 0
+
+        # Refresh every column's row window [row_lo, i-1] and its maximum.
+        for j in range(m):
+            dq = col_deq[j]
+            if i > 0:
+                sr = i - 1
+                v = col_val[j][sr]
+                if v is not None:
+                    while dq and col_val[j][dq[-1]] <= v:
+                        dq.pop()
+                    dq.append(sr)
+            while dq and dq[0] < row_lo:
+                dq.popleft()
+            col_top[j] = col_val[j][dq[0]] if dq else None
+
+        global_deq.clear()
+        for j in range(m):
+            e = a - B[j] - offset
+            if -tol <= e <= tol:
+                ae = e if e >= 0 else -e
+                nae = -ae
+                pred = col_top[global_deq[0]] if global_deq else None
+                if pred is None:
+                    chain = (1, nae, nae)
+                else:
+                    p2 = pred[2]
+                    chain = (
+                        pred[0] + 1,
+                        pred[1] - ae,
+                        p2 if p2 < nae else nae,
+                    )
+                col_val[j][i] = chain
+                if final is None or chain > final:
+                    final = chain
+
+            # Column j becomes an eligible predecessor for later columns.
+            v = col_top[j]
+            if v is not None:
+                while global_deq and col_top[global_deq[-1]] <= v:
+                    global_deq.pop()
+                global_deq.append(j)
+
+            # The next cell j+1 may only start at columns >= j+1-gb-1.
+            next_lo = j - max_gap_b
+            while global_deq and global_deq[0] < next_lo:
+                global_deq.popleft()
+
+    return final if final is not None else (0, 0, 0)
+
+
+def _edge_critical_offsets(
+    A: Sequence[int], B: Sequence[int], tol: int, lo: int, hi: int
+) -> set:
+    """Phase-1 offsets: window boundaries, residual kinks, interval ends.
+
+    Objectives 1 (pair count) and 2 (absolute-residual sum) of the joint
+    optimum are provably attained on this set; see the module docstring.
+    """
     cand = {lo, hi}
-    # Feasibility boundaries (c-T first feasible, c+T last feasible,
-    # c+T+1 first infeasible) and residual kink (c) for each edge.
-    for _i, _j, cv in edges:
-        for d in (cv - tol, cv, cv + tol, cv + tol + 1):
-            if lo <= d <= hi:
-                cand.add(d)
+    for a in A:
+        for b in B:
+            cv = a - b
+            for d in (cv - tol, cv, cv + tol, cv + tol + 1):
+                if lo <= d <= hi:
+                    cand.add(d)
+    return cand
 
-    # Objective-3 optima: midpoint of the two residual extrema of some
-    # matching, i.e. of two edges the matching can contain simultaneously.
-    # Edges (i,j) and (i',j') co-occur only when their index order agrees;
-    # at the midpoint both must lie inside tolerance, which requires
-    # |c - c'| <= 2*tol.
-    for x in range(len(edges)):
-        i, j, c1 = edges[x]
-        for y in range(x + 1, len(edges)):
-            i2, j2, c2 = edges[y]
-            if (i2 - i) * (j2 - j) <= 0:
-                continue  # same index or an inversion -> never in one matching
-            if c1 > c2:
-                chi, clo = c1, c2
-            else:
-                chi, clo = c2, c1
-            if chi - clo > 2 * tol:
-                continue
-            # Both edges' joint feasible window at the midpoint.
-            flo = max(lo, chi - tol)
-            fhi = min(hi, clo + tol)
+
+def _midpoint_offsets(
+    A: Sequence[int],
+    B: Sequence[int],
+    tol: int,
+    lo: int,
+    hi: int,
+    maxabs_ub: int,
+) -> set:
+    """Phase-2 offsets: extrema midpoints that can still improve objective 3.
+
+    Only co-orderable edge pairs whose c-values differ by at most
+    ``2 * maxabs_ub`` can be the residual extrema of a matching whose
+    largest absolute residual beats the phase-1 bound, so only their
+    midpoints (clamped to the pair's joint feasible window) are generated;
+    see the module docstring for the sufficiency argument.
+    """
+    edges = sorted(
+        (a - b, i, j) for i, a in enumerate(A) for j, b in enumerate(B)
+    )
+    cand = set()
+    limit = 2 * maxabs_ub
+    k = len(edges)
+    for x in range(k):
+        c1, i1, j1 = edges[x]
+        for y in range(x + 1, k):
+            c2, i2, j2 = edges[y]
+            if c2 - c1 > limit:
+                break  # sorted by c: no later pair is within the spread
+            if (i2 - i1) * (j2 - j1) <= 0:
+                continue  # same index or an inversion -> never co-occur
+            # Both edges' joint feasible window intersected with [lo, hi].
+            flo = c2 - tol
+            if flo < lo:
+                flo = lo
+            fhi = c1 + tol
+            if fhi > hi:
+                fhi = hi
             if flo > fhi:
                 continue
             total = c1 + c2
-            mid_floor = total // 2
-            mid_ceil = -((-total) // 2)
-            for md in (mid_floor, mid_ceil):
+            for md in (total // 2, -((-total) // 2)):
                 d = md if flo <= md <= fhi else (flo if md < flo else fhi)
                 if lo <= d <= hi:
                     cand.add(d)
+    return cand
 
-    return sorted(cand)
+
+def _diagonal_score(
+    A: Sequence[int], B: Sequence[int], tol: int, lo: int, hi: int
+):
+    """O(n) score function for the forced-diagonal case, else None.
+
+    When both probes produced the same number of pulses and the diagonal
+    matching (i, i) is feasible at some offset in [lo, hi], the maximum
+    pair count is n and the diagonal is the *only* order-preserving
+    matching that reaches it (an order-preserving bijection of two
+    n-sequences is unique, and it skips no pulses, so gap limits never
+    exclude it).  Every objective is then a direct function of the
+    diagonal residuals c_ii, so each candidate offset is scored without
+    running the DP.  The returned function yields None for offsets where
+    the diagonal is infeasible: their pair count is below n, so they can
+    never be optimal.
+    """
+    n = len(A)
+    if n != len(B):
+        return None
+    diag = [a - b for a, b in zip(A, B)]
+    c_lo = min(diag)
+    c_hi = max(diag)
+    # The diagonal is feasible at d iff d lies in [c_hi - tol, c_lo + tol].
+    flo = lo if lo > c_hi - tol else c_hi - tol
+    fhi = hi if hi < c_lo + tol else c_lo + tol
+    if flo > fhi:
+        return None
+
+    def score(d: int) -> Optional[Tuple[int, int, int]]:
+        if d < c_hi - tol or d > c_lo + tol:
+            return None
+        s = 0
+        for cv in diag:
+            diff = cv - d
+            s += diff if diff >= 0 else -diff
+        above = c_hi - d
+        below = d - c_lo
+        return (n, -s, -(above if above > below else below))
+
+    return score
+
+
+def _best_offset(
+    A: Sequence[int],
+    B: Sequence[int],
+    lo: int,
+    hi: int,
+    tol: int,
+    score,
+) -> int:
+    """Exact global maximiser of (count, -abs_sum, -max_abs, -offset).
+
+    ``score(d)`` returns the first three objective components of the optimal
+    matching at offset ``d`` (``_best_score_at`` or
+    ``_best_score_constrained``); it is bypassed whenever the forced-diagonal
+    fast path of ``_diagonal_score`` applies.  Phase 1 determines objectives
+    1 and 2 and an upper bound on objective 3; phase 2 evaluates exactly
+    those extrema midpoints that can still improve objective 3.  Together
+    the two phases cover every offset where the lexicographic optimum can
+    lie, so the result equals scanning the full critical-value set (and
+    every integer offset) with the matching DP.
+    """
+    diag_score = _diagonal_score(A, B, tol, lo, hi)
+    if diag_score is not None:
+        score = diag_score
+
+    best: Optional[Tuple[int, int, int, int]] = None
+    seen = _edge_critical_offsets(A, B, tol, lo, hi)
+    for d in seen:
+        s = score(d)
+        if s is None:
+            continue
+        cand = (s[0], s[1], s[2], -d)
+        if best is None or cand > best:
+            best = cand
+    assert best is not None
+
+    maxabs_ub = -best[2]
+    if maxabs_ub > 0:  # a zero largest residual cannot be improved
+        for d in _midpoint_offsets(A, B, tol, lo, hi, maxabs_ub):
+            if d in seen:
+                continue
+            s = score(d)
+            if s is None:
+                continue
+            cand = (s[0], s[1], s[2], -d)
+            if cand > best:
+                best = cand
+    return -best[3]
 
 
 @dataclass(frozen=True)
@@ -500,34 +732,33 @@ def solve(
     """
     lo, hi = offset_min, offset_max
 
-    def evaluate(d: int):
-        if gap_limit_enabled:
-            assert max_gap_a is not None and max_gap_b is not None
-            return best_pairing_constrained(
-                A, B, d, tolerance, max_gap_a, max_gap_b
-            )
-        c = _residual_matrix(A, B, d)
-        return best_pairing_at(c, tolerance)
+    if gap_limit_enabled:
+        assert max_gap_a is not None and max_gap_b is not None
+        ga: int = max_gap_a
+        gb: int = max_gap_b
 
-    # Global lexicographic record: (count, -cost, -max_abs, -offset)
-    # maximised; the matching itself is re-derived canonically at the winning
-    # offset so the index tie-break is applied at exactly that offset.
-    best_score: Optional[Tuple[int, int, int, int]] = None
-    best_offset = lo
+        def score(d: int) -> Tuple[int, int, int]:
+            return _best_score_constrained(A, B, d, tolerance, ga, gb)
 
-    for d in _candidate_offsets(A, B, tolerance, lo, hi):
-        obj, _pairs = evaluate(d)
-        count, neg_cost, neg_max_abs, _key = obj
+    else:
 
-        score = (count, neg_cost, neg_max_abs, -d)
-        if best_score is None or score > best_score:
-            best_score = score
-            best_offset = d
+        def score(d: int) -> Tuple[int, int, int]:
+            return _best_score_at(A, B, d, tolerance)
 
-    assert best_score is not None
+    # Global lexicographic record (count, -cost, -max_abs, -offset) maximised
+    # over the provably sufficient two-phase candidate set.
+    best_offset = _best_offset(A, B, lo, hi, tolerance, score)
 
-    # Re-derive the canonical matching at the winning offset.
-    obj, pairs = evaluate(best_offset)
+    # Re-derive the canonical matching at the winning offset so the index
+    # tie-break is applied at exactly that offset.
+    if gap_limit_enabled:
+        _obj, pairs = best_pairing_constrained(
+            A, B, best_offset, tolerance, max_gap_a, max_gap_b
+        )
+    else:
+        _obj, pairs = best_pairing_at(
+            _residual_matrix(A, B, best_offset), tolerance
+        )
 
     pair_objs = tuple(
         Pair(
@@ -570,15 +801,14 @@ def solve(
             # The unconstrained optimum is solved only here (the shortfall
             # path); it never takes part in the constrained decision, so this
             # is not a "take the optimum and cut it" pipeline.
-            unc_score: Optional[Tuple[int, int, int, int]] = None
-            unc_offset = lo
-            for d in _candidate_offsets(A, B, tolerance, lo, hi):
-                c = _residual_matrix(A, B, d)
-                u_obj, _ = best_pairing_at(c, tolerance)
-                u_score = (u_obj[0], u_obj[1], u_obj[2], -d)
-                if unc_score is None or u_score > unc_score:
-                    unc_score = u_score
-                    unc_offset = d
+            unc_offset = _best_offset(
+                A,
+                B,
+                lo,
+                hi,
+                tolerance,
+                lambda d: _best_score_at(A, B, d, tolerance),
+            )
             _, unc_pairs = best_pairing_at(
                 _residual_matrix(A, B, unc_offset), tolerance
             )
